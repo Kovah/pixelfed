@@ -145,6 +145,21 @@ Route::group(['prefix' => 'api'], function() use($middleware) {
 			Route::get('posts/trending', 'DiscoverController@trendingApi')->middleware($middleware);
 			Route::get('posts/hashtags', 'DiscoverController@trendingHashtags')->middleware($middleware);
 		});
+
+		Route::group(['prefix' => 'directory'], function () use($middleware) {
+			Route::get('listing', 'PixelfedDirectoryController@get');
+		});
+
+		Route::group(['prefix' => 'auth'], function () use($middleware) {
+			Route::get('iarpfc', 'Api\ApiV1Dot1Controller@inAppRegistrationPreFlightCheck');
+			Route::post('iar', 'Api\ApiV1Dot1Controller@inAppRegistration');
+			Route::post('iarc', 'Api\ApiV1Dot1Controller@inAppRegistrationConfirm');
+			Route::get('iarer', 'Api\ApiV1Dot1Controller@inAppRegistrationEmailRedirect');
+
+			Route::post('invite/admin/verify', 'AdminInviteController@apiVerifyCheck')->middleware('throttle:20,120');
+			Route::post('invite/admin/uc', 'AdminInviteController@apiUsernameCheck')->middleware('throttle:20,120');
+			Route::post('invite/admin/ec', 'AdminInviteController@apiEmailCheck')->middleware('throttle:10,1440');
+		});
 	});
 
 	Route::group(['prefix' => 'live'], function() use($middleware) {
