@@ -137,9 +137,8 @@ class StatusService
 
 	public static function del($id, $purge = false)
 	{
-		$status = self::get($id);
-
 		if($purge) {
+			$status = self::get($id);
 			if($status && isset($status['account']) && isset($status['account']['id'])) {
 				Cache::forget('profile:embed:' . $status['account']['id']);
 			}

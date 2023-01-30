@@ -1033,7 +1033,7 @@ export default {
 	},
 
 	beforeMount() {
-		this.filters = window.App.util.filters;
+		this.filters = window.App.util.filters.sort();
 		axios.get('/api/compose/v0/settings')
 		.then(res => {
 			this.composeSettings = res.data;

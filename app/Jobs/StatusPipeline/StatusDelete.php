@@ -50,6 +50,9 @@ class StatusDelete implements ShouldQueue
 	 */
 	public $deleteWhenMissingModels = true;
 
+    public $timeout = 900;
+    public $tries = 2;
+
 	/**
 	 * Create a new job instance.
 	 *
@@ -71,10 +74,11 @@ class StatusDelete implements ShouldQueue
 		$profile = $this->status->profile;
 
 		StatusService::del($status->id, true);
-
-		if(in_array($status->type, ['photo', 'photo:album', 'video', 'video:album', 'photo:video:album'])) {
-			$profile->status_count = $profile->status_count - 1;
-			$profile->save();
+		if($profile) {
+			if(in_array($status->type, ['photo', 'photo:album', 'video', 'video:album', 'photo:video:album'])) {
+				$profile->status_count = $profile->status_count - 1;
+				$profile->save();
+			}
 		}
 
 		if(config_cache('federation.activitypub.enabled') == true) {
@@ -96,6 +100,7 @@ class StatusDelete implements ShouldQueue
 			$parent = Status::findOrFail($status->in_reply_to_id);
 			--$parent->reply_count;
 			$parent->save();
+			StatusService::del($parent->id);
 		}
 
         Bookmark::whereStatusId($status->id)->delete();
@@ -131,15 +136,20 @@ class StatusDelete implements ShouldQueue
 			->where('item_id', $status->id)
 			->delete();
 
-		$status->forceDelete();
+		$status->delete();
 
 		return 1;
 	}
 
 	public function fanoutDelete($status)
 	{
-		$audience = $status->profile->getAudienceInbox();
 		$profile = $status->profile;
+
+		if(!$profile) {
+			return;
+		}
+
+		$audience = $status->profile->getAudienceInbox();
 
 		$fractal = new Fractal\Manager();
 		$fractal->setSerializer(new ArraySerializer());

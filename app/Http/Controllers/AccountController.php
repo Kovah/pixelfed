@@ -409,7 +409,7 @@ class AccountController extends Controller
 				AccountService::del($profile->id);
 
 				if($follower->domain != null && $follower->private_key === null) {
-					FollowAcceptPipeline::dispatch($followRequest);
+					FollowAcceptPipeline::dispatch($followRequest)->onQueue('follow');
 				} else {
 					FollowPipeline::dispatch($follow);
 					$followRequest->delete();
@@ -418,7 +418,7 @@ class AccountController extends Controller
 
 			case 'reject':
 				if($follower->domain != null && $follower->private_key === null) {
-					FollowRejectPipeline::dispatch($followRequest);
+					FollowRejectPipeline::dispatch($followRequest)->onQueue('follow');
 				} else {
 					$followRequest->delete();
 				}
@@ -513,26 +513,25 @@ class AccountController extends Controller
 		}
 	}
 
-	protected function twoFactorBackupCheck($request, $code, User $user)
-	{
-		$backupCodes = $user->{'2fa_backup_codes'};
-		if($backupCodes) {
-			$codes = json_decode($backupCodes, true);
-			foreach ($codes as $c) {
-				if(hash_equals($c, $code)) {
-					$codes = array_flatten(array_diff($codes, [$code]));
-					$user->{'2fa_backup_codes'} = json_encode($codes);
-					$user->save();
-					$request->session()->push('2fa.session.active', true);
-					return true;
-				} else {
-					return false;
-				}
-			}
-		} else {
-			return false;
-		}
-	}
+    protected function twoFactorBackupCheck($request, $code, User $user)
+    {
+        $backupCodes = $user->{'2fa_backup_codes'};
+        if($backupCodes) {
+            $codes = json_decode($backupCodes, true);
+            foreach ($codes as $c) {
+                if(hash_equals($c, $code)) {
+                    $codes = array_flatten(array_diff($codes, [$code]));
+                    $user->{'2fa_backup_codes'} = json_encode($codes);
+                    $user->save();
+                    $request->session()->push('2fa.session.active', true);
+                    return true;
+                }
+            }
+            return false;
+        } else {
+            return false;
+        }
+    }
 
 	public function accountRestored(Request $request)
 	{

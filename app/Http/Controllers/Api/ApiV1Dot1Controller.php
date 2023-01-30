@@ -11,15 +11,24 @@ use League\Fractal\Serializer\ArraySerializer;
 use League\Fractal\Pagination\IlluminatePaginatorAdapter;
 use App\AccountLog;
 use App\EmailVerification;
+use App\Place;
 use App\Status;
 use App\Report;
 use App\Profile;
+use App\StatusArchived;
+use App\User;
 use App\Services\AccountService;
 use App\Services\StatusService;
 use App\Services\ProfileStatusService;
+use App\Util\Lexer\RestrictedNames;
+use App\Services\EmailService;
+use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Hash;
 use Jenssegers\Agent\Agent;
 use Mail;
 use App\Mail\PasswordChange;
+use App\Mail\ConfirmAppEmail;
+use App\Http\Resources\StatusStateless;
 
 class ApiV1Dot1Controller extends Controller
 {
@@ -401,5 +410,259 @@ class ApiV1Dot1Controller extends Controller
         });
 
         return $this->json($res);
+    }
+
+    public function inAppRegistrationPreFlightCheck(Request $request)
+    {
+        return [
+            'open' => config('pixelfed.open_registration'),
+            'iara' => config('pixelfed.allow_app_registration')
+        ];
+    }
+
+    public function inAppRegistration(Request $request)
+    {
+        abort_if($request->user(), 404);
+        abort_unless(config('pixelfed.open_registration'), 404);
+        abort_unless(config('pixelfed.allow_app_registration'), 404);
+        abort_unless($request->hasHeader('X-PIXELFED-APP'), 403);
+        $this->validate($request, [
+            'email' => [
+                'required',
+                'string',
+                'email',
+                'max:255',
+                'unique:users',
+                function ($attribute, $value, $fail) {
+                    $banned = EmailService::isBanned($value);
+                    if($banned) {
+                        return $fail('Email is invalid.');
+                    }
+                },
+            ],
+            'username' => [
+                'required',
+                'min:2',
+                'max:15',
+                'unique:users',
+                function ($attribute, $value, $fail) {
+                    $dash = substr_count($value, '-');
+                    $underscore = substr_count($value, '_');
+                    $period = substr_count($value, '.');
+
+                    if(ends_with($value, ['.php', '.js', '.css'])) {
+                        return $fail('Username is invalid.');
+                    }
+
+                    if(($dash + $underscore + $period) > 1) {
+                        return $fail('Username is invalid. Can only contain one dash (-), period (.) or underscore (_).');
+                    }
+
+                    if (!ctype_alnum($value[0])) {
+                        return $fail('Username is invalid. Must start with a letter or number.');
+                    }
+
+                    if (!ctype_alnum($value[strlen($value) - 1])) {
+                        return $fail('Username is invalid. Must end with a letter or number.');
+                    }
+
+                    $val = str_replace(['_', '.', '-'], '', $value);
+                    if(!ctype_alnum($val)) {
+                        return $fail('Username is invalid. Username must be alpha-numeric and may contain dashes (-), periods (.) and underscores (_).');
+                    }
+
+                    $restricted = RestrictedNames::get();
+                    if (in_array(strtolower($value), array_map('strtolower', $restricted))) {
+                        return $fail('Username cannot be used.');
+                    }
+                },
+            ],
+            'password' => 'required|string|min:8',
+        ]);
+
+        $email = $request->input('email');
+        $username = $request->input('username');
+        $password = $request->input('password');
+
+        if(config('database.default') == 'pgsql') {
+            $username = strtolower($username);
+            $email = strtolower($email);
+        }
+
+        $user = new User;
+        $user->name = $username;
+        $user->username = $username;
+        $user->email = $email;
+        $user->password = Hash::make($password);
+        $user->register_source = 'app';
+        $user->app_register_ip = $request->ip();
+        $user->app_register_token = Str::random(32);
+        $user->save();
+
+        $rtoken = Str::random(mt_rand(64, 70));
+
+        $verify = new EmailVerification();
+        $verify->user_id = $user->id;
+        $verify->email = $user->email;
+        $verify->user_token = $user->app_register_token;
+        $verify->random_token = $rtoken;
+        $verify->save();
+
+        $appUrl = url('/api/v1.1/auth/iarer?ut=' . $user->app_register_token . '&rt=' . $rtoken);
+
+        Mail::to($user->email)->send(new ConfirmAppEmail($verify, $appUrl));
+
+        return response()->json([
+            'success' => true,
+        ]);
+    }
+
+    public function inAppRegistrationEmailRedirect(Request $request)
+    {
+        $this->validate($request, [
+            'ut' => 'required',
+            'rt' => 'required'
+        ]);
+        $ut = $request->input('ut');
+        $rt = $request->input('rt');
+        $url = 'pixelfed://confirm-account/'. $ut . '?rt=' . $rt;
+        return redirect()->away($url);
+    }
+
+    public function inAppRegistrationConfirm(Request $request)
+    {
+        abort_if($request->user(), 404);
+        abort_unless(config('pixelfed.open_registration'), 404);
+        abort_unless(config('pixelfed.allow_app_registration'), 404);
+        abort_unless($request->hasHeader('X-PIXELFED-APP'), 403);
+        $this->validate($request, [
+            'user_token' => 'required',
+            'random_token' => 'required',
+            'email' => 'required'
+        ]);
+
+        $verify = EmailVerification::whereEmail($request->input('email'))
+            ->whereUserToken($request->input('user_token'))
+            ->whereRandomToken($request->input('random_token'))
+            ->first();
+
+        if(!$verify) {
+            return response()->json(['error' => 'Invalid tokens'], 403);
+        }
+
+        if($verify->created_at->lt(now()->subHours(24))) {
+            $verify->delete();
+            return response()->json(['error' => 'Invalid tokens'], 403);
+        }
+
+        $user = User::findOrFail($verify->user_id);
+        $user->email_verified_at = now();
+        $user->last_active_at = now();
+        $user->save();
+
+        $token = $user->createToken('Pixelfed');
+
+        return response()->json([
+            'access_token' => $token->accessToken
+        ]);
+    }
+
+    public function archive(Request $request, $id)
+    {
+        abort_if(!$request->user(), 403);
+
+        $status = Status::whereNull('in_reply_to_id')
+            ->whereNull('reblog_of_id')
+            ->whereProfileId($request->user()->profile_id)
+            ->findOrFail($id);
+
+        if($status->scope === 'archived') {
+            return [200];
+        }
+
+        $archive = new StatusArchived;
+        $archive->status_id = $status->id;
+        $archive->profile_id = $status->profile_id;
+        $archive->original_scope = $status->scope;
+        $archive->save();
+
+        $status->scope = 'archived';
+        $status->visibility = 'draft';
+        $status->save();
+        StatusService::del($status->id, true);
+        AccountService::syncPostCount($status->profile_id);
+
+        return [200];
+    }
+
+
+    public function unarchive(Request $request, $id)
+    {
+        abort_if(!$request->user(), 403);
+
+        $status = Status::whereNull('in_reply_to_id')
+            ->whereNull('reblog_of_id')
+            ->whereProfileId($request->user()->profile_id)
+            ->findOrFail($id);
+
+        if($status->scope !== 'archived') {
+            return [200];
+        }
+
+        $archive = StatusArchived::whereStatusId($status->id)
+            ->whereProfileId($status->profile_id)
+            ->firstOrFail();
+
+        $status->scope = $archive->original_scope;
+        $status->visibility = $archive->original_scope;
+        $status->save();
+        $archive->delete();
+        StatusService::del($status->id, true);
+        AccountService::syncPostCount($status->profile_id);
+
+        return [200];
+    }
+
+    public function archivedPosts(Request $request)
+    {
+        abort_if(!$request->user(), 403);
+
+        $statuses = Status::whereProfileId($request->user()->profile_id)
+            ->whereScope('archived')
+            ->orderByDesc('id')
+            ->cursorPaginate(10);
+
+        return StatusStateless::collection($statuses);
+    }
+
+    public function placesById(Request $request, $id, $slug)
+    {
+        abort_if(!$request->user(), 403);
+
+        $place = Place::whereSlug($slug)->findOrFail($id);
+
+        $posts = Cache::remember('pf-api:v1.1:places-by-id:' . $place->id, 3600, function() use($place) {
+            return Status::wherePlaceId($place->id)
+                ->whereNull('uri')
+                ->whereScope('public')
+                ->orderByDesc('created_at')
+                ->limit(60)
+                ->pluck('id');
+        });
+
+        $posts = $posts->map(function($id) {
+            return StatusService::get($id);
+        })
+        ->filter()
+        ->values();
+
+        return ['place' => [
+            'id' => $place->id,
+            'name' => $place->name,
+            'slug' => $place->slug,
+            'country' => $place->country,
+            'lat' => $place->lat,
+            'long' => $place->long
+        ], 'posts' => $posts];
     }
 }

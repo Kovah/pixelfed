@@ -8,7 +8,7 @@ use Illuminate\Support\Str;
 use App\Util\ActivityPub\Helpers;
 use App\Util\Media\Filter;
 use Laravel\Passport\Passport;
-use Auth, Cache, DB, URL;
+use Auth, Cache, DB, Storage, URL;
 use App\{
 	Avatar,
 	Bookmark,
@@ -61,12 +61,14 @@ use App\Jobs\VideoPipeline\{
 
 use App\Services\{
 	AccountService,
+	BookmarkService,
 	CollectionService,
 	FollowerService,
 	InstanceService,
 	LikeService,
 	NetworkTimelineService,
 	NotificationService,
+	MediaService,
 	MediaPathService,
     ProfileStatusService,
 	PublicTimelineService,
@@ -89,6 +91,8 @@ use App\Services\MarkerService;
 use App\Models\Conversation;
 use App\Jobs\FollowPipeline\FollowAcceptPipeline;
 use App\Jobs\FollowPipeline\FollowRejectPipeline;
+use Illuminate\Support\Facades\RateLimiter;
+use Purify;
 
 class ApiV1Controller extends Controller
 {
@@ -221,7 +225,7 @@ class ApiV1Controller extends Controller
 		abort_if(!$request->user(), 403);
 
 		$this->validate($request, [
-			'avatar'			=> 'sometimes|mimetypes:image/jpeg,image/png|min:10|max:' . config('pixelfed.max_avatar_size'),
+			'avatar'			=> 'sometimes|mimetypes:image/jpeg,image/png|max:' . config('pixelfed.max_avatar_size'),
 			'display_name'      => 'nullable|string|max:30',
 			'note'              => 'nullable|string|max:200',
 			'locked'            => 'nullable',
@@ -650,7 +654,6 @@ class ApiV1Controller extends Controller
 			->whereNull('status')
 			->findOrFail($id);
 
-
 		$private = (bool) $target->is_private;
 		$remote = (bool) $target->domain;
 		$blocked = UserFilter::whereUserId($target->id)
@@ -674,13 +677,8 @@ class ApiV1Controller extends Controller
 		}
 
 		// Rate limits, max 7500 followers per account
-		if($user->profile->following()->count() >= Follower::MAX_FOLLOWING) {
+		if($user->profile->following_count && $user->profile->following_count >= Follower::MAX_FOLLOWING) {
 			abort(400, 'You cannot follow more than ' . Follower::MAX_FOLLOWING . ' accounts');
-		}
-
-		// Rate limits, follow 30 accounts per hour max
-		if($user->profile->following()->where('followers.created_at', '>', now()->subHour())->count() >= Follower::FOLLOW_PER_HOUR) {
-			abort(400, 'You can only follow ' . Follower::FOLLOW_PER_HOUR . ' users per hour');
 		}
 
 		if($private == true) {
@@ -692,15 +690,16 @@ class ApiV1Controller extends Controller
 				(new FollowerController())->sendFollow($user->profile, $target);
 			}
 		} else {
-			$follower = new Follower();
-			$follower->profile_id = $user->profile_id;
-			$follower->following_id = $target->id;
-			$follower->save();
+			$follower = Follower::firstOrCreate([
+				'profile_id' => $user->profile_id,
+				'following_id' => $target->id
+			]);
 
 			if($remote == true && config('federation.activitypub.remoteFollow') == true) {
 				(new FollowerController())->sendFollow($user->profile, $target);
 			}
 			FollowPipeline::dispatch($follower);
+			$target->increment('followers_count');
 		}
 
 		RelationshipService::refresh($user->profile_id, $target->id);
@@ -761,11 +760,6 @@ class ApiV1Controller extends Controller
 			return $this->json($res);
 		}
 
-		// Rate limits, follow 30 accounts per hour max
-		if($user->profile->following()->where('followers.updated_at', '>', now()->subHour())->count() >= Follower::FOLLOW_PER_HOUR) {
-			abort(400, 'You can only follow or unfollow ' . Follower::FOLLOW_PER_HOUR . ' users per hour');
-		}
-
 		if($user->profile->following_count) {
 			$user->profile->decrement('following_count');
 		}
@@ -777,6 +771,14 @@ class ApiV1Controller extends Controller
 		Follower::whereProfileId($user->profile_id)
 			->whereFollowingId($target->id)
 			->delete();
+
+		if(config('instance.timeline.home.cached')) {
+            Cache::forget('pf:timelines:home:' . $user->profile_id);
+        }
+
+		FollowerService::remove($user->profile_id, $target->id);
+
+		$target->decrement('followers_count');
 
 		if($remote == true && config('federation.activitypub.remoteFollow') == true) {
 			(new FollowerController())->sendUndoFollow($user->profile, $target);
@@ -1262,7 +1264,7 @@ class ApiV1Controller extends Controller
 		AccountService::del($profile->id);
 
 		if($follower->domain != null && $follower->private_key === null) {
-			FollowAcceptPipeline::dispatch($followRequest);
+			FollowAcceptPipeline::dispatch($followRequest)->onQueue('follow');
 		} else {
 			FollowPipeline::dispatch($follow);
 			$followRequest->delete();
@@ -1300,7 +1302,7 @@ class ApiV1Controller extends Controller
 		$follower = $followRequest->follower;
 
 		if($follower->domain != null && $follower->private_key === null) {
-			FollowRejectPipeline::dispatch($followRequest);
+			FollowRejectPipeline::dispatch($followRequest)->onQueue('follow');
 		} else {
 			$followRequest->delete();
 		}
@@ -1375,7 +1377,7 @@ class ApiV1Controller extends Controller
 					'streaming_api' => 'wss://' . config('pixelfed.domain.app')
 				],
 				'stats' => $stats,
-				'thumbnail' => url('img/pixelfed-icon-color.png'),
+				'thumbnail' => config_cache('app.banner_image') ?? url(Storage::url('public/headers/default.jpg')),
 				'languages' => [config('app.locale')],
 				'registrations' => (bool) config_cache('pixelfed.open_registration'),
 				'approval_required' => false,
@@ -1583,15 +1585,33 @@ class ApiV1Controller extends Controller
 		$user = $request->user();
 
 		$media = Media::whereUserId($user->id)
-			->whereNull('status_id')
+			->whereProfileId($user->profile_id)
 			->findOrFail($id);
 
-		$media->caption = $request->input('description');
-		$media->save();
+		$executed = RateLimiter::attempt(
+			'media:update:'.$user->id,
+			10,
+			function() use($media, $request) {
+				$caption = Purify::clean($request->input('description'));
 
-		$resource = new Fractal\Resource\Item($media, new MediaTransformer());
-		$res = $this->fractal->createData($resource)->toArray();
-		return $this->json($res);
+				if($caption != $media->caption) {
+					$media->caption = $caption;
+					$media->save();
+
+					if($media->status_id) {
+						MediaService::del($media->status_id);
+						StatusService::del($media->status_id);
+					}
+				}
+		});
+
+		if(!$executed) {
+			return response()->json([
+				'error' => 'Too many attempts. Try again in a few minutes.'
+			], 429);
+		};
+
+		return $this->json(MediaService::get($media->status_id));
 	}
 
 	/**
@@ -1941,10 +1961,79 @@ class ApiV1Controller extends Controller
 		$limit = $request->input('limit') ?? 20;
 		$pid = $request->user()->profile_id;
 
-		$following = Cache::remember('profile:following:'.$pid, now()->addMinutes(1440), function() use($pid) {
+		$following = Cache::remember('profile:following:'.$pid, 1209600, function() use($pid) {
 			$following = Follower::whereProfileId($pid)->pluck('following_id');
 			return $following->push($pid)->toArray();
 		});
+
+		if(config('instance.timeline.home.cached') && (!$min && !$max)) {
+            $ttl = config('instance.timeline.home.cache_ttl');
+            $res = Cache::remember(
+                'pf:timelines:home:' . $pid,
+                $ttl,
+                function() use(
+                $following,
+                $limit,
+                $pid
+                ) {
+                return Status::select(
+                    'id',
+                    'uri',
+                    'caption',
+                    'rendered',
+                    'profile_id',
+                    'type',
+                    'in_reply_to_id',
+                    'reblog_of_id',
+                    'is_nsfw',
+                    'scope',
+                    'local',
+                    'reply_count',
+                    'comments_disabled',
+                    'place_id',
+                    'likes_count',
+                    'reblogs_count',
+                    'created_at',
+                    'updated_at'
+                  )
+                  ->whereIn('type', ['photo', 'photo:album', 'video', 'video:album', 'photo:video:album'])
+                  ->whereIn('profile_id', $following)
+                  ->whereIn('visibility',['public', 'unlisted', 'private'])
+                  ->orderBy('created_at', 'desc')
+                  ->limit($limit)
+                  ->get()
+                  ->map(function($s) {
+                       $status = StatusService::get($s->id, false);
+                       if(!$status) {
+                            return false;
+                       }
+                       return $status;
+                  })
+                  ->filter(function($s) {
+                        return $s && isset($s['account']['id']);
+                  })
+                  ->values()
+                  ->toArray();
+            });
+
+            $res = collect($res)
+                ->map(function($s) use ($pid) {
+                    $status = StatusService::get($s['id'], false);
+                    if(!$status) {
+                        return false;
+                    }
+                    $status['favourited'] = (bool) LikeService::liked($pid, $s['id']);
+                    $status['bookmarked'] = (bool) BookmarkService::get($pid, $s['id']);
+                    $status['reblogged'] = (bool) ReblogService::get($pid, $s['id']);
+                    return $status;
+                })
+                ->filter(function($s) {
+                    return $s && isset($s['account']['id']);
+                })
+                ->values()
+                ->take($limit)
+                ->toArray();
+		}
 
 		if($min || $max) {
 			$dir = $min ? '>' : '<';
@@ -2507,6 +2596,7 @@ class ApiV1Controller extends Controller
 
 		$ids = $request->input('media_ids');
 		$in_reply_to_id = $request->input('in_reply_to_id');
+
 		$user = $request->user();
 		$profile = $user->profile;
 
@@ -2786,6 +2876,8 @@ class ApiV1Controller extends Controller
 	 */
 	public function timelineHashtag(Request $request, $hashtag)
 	{
+		abort_if(!$request->user(), 403);
+
 		$this->validate($request,[
 		  'page'        => 'nullable|integer|max:40',
 		  'min_id'      => 'nullable|integer|min:0|max:' . PHP_INT_MAX,
@@ -2799,6 +2891,10 @@ class ApiV1Controller extends Controller
 
 		if(!$tag) {
 			return response()->json([]);
+		}
+
+		if($tag->is_banned == true) {
+			return $this->json([]);
 		}
 
 		$min = $request->input('min_id');
@@ -2860,24 +2956,20 @@ class ApiV1Controller extends Controller
 		$dir = $min_id ? '>' : '<';
 		$id = $min_id ?? $max_id;
 
-		if($id) {
-			$bookmarks = Bookmark::whereProfileId($pid)
-				->where('status_id', $dir, $id)
-				->limit($limit)
-				->pluck('status_id');
-		} else {
-			$bookmarks = Bookmark::whereProfileId($pid)
-				->latest()
-				->limit($limit)
-				->pluck('status_id');
-		}
+		$bookmarks = Bookmark::whereProfileId($pid)
+			->when($id, function($id, $query) use($dir) {
+				return $query->where('status_id', $dir, $id);
+			})
+			->limit($limit)
+			->pluck('status_id')
+			->map(function($id) {
+				return \App\Services\StatusService::getMastodon($id);
+			})
+			->filter()
+			->values()
+			->toArray();
 
-		$res = [];
-		foreach($bookmarks as $id) {
-			$res[] = \App\Services\StatusService::getMastodon($id);
-		}
-
-		return $this->json($res);
+		return $this->json($bookmarks);
 	}
 
 	/**
@@ -3023,7 +3115,7 @@ class ApiV1Controller extends Controller
 		}
 
 		if($sortBy == 'all' && !$request->has('cursor')) {
-			$ids = Cache::remember('status:replies:all:' . $id, 86400, function() use($id) {
+			$ids = Cache::remember('status:replies:all:' . $id, 3600, function() use($id) {
 				return DB::table('statuses')
 					->where('in_reply_to_id', $id)
 					->orderBy('id')
@@ -3058,8 +3150,15 @@ class ApiV1Controller extends Controller
 			$status['favourited'] = LikeService::liked($pid, $post->id);
 			return $status;
 		})
+		->map(function($post) {
+			if(isset($post['account']) && isset($post['account']['id'])) {
+				$account = AccountService::get($post['account']['id'], true);
+				$post['account'] = $account;
+			}
+			return $post;
+		})
 		->filter(function($post) {
-			return $post && isset($post['id']) && isset($post['account']);
+			return $post && isset($post['id']) && isset($post['account']) && isset($post['account']['id']);
 		})
 		->values();
 
